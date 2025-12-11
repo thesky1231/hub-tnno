@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+import torch
+from loader import load_data
+import numpy as np
+import torch.nn.functional as F
+
+
+class Evaluator:
+    def __init__(self, config, model, logger):
+        self.config = config
+        self.model = model
+        self.logger = logger
+        self.valid_data = load_data(config["valid_data_path"], config, shuffle=False)
+        self.train_data = load_data(config["train_data_path"], config)
+        self.encode_single_sentence = self.train_data.dataset.encode_single_sentence
+        self.stats_dict = {"correct": 0, "wrong": 0}
+
+    def knwb_to_vector(self):
+        self.question_index_to_standard_question_index = {}
+        self.knwb_vectors = []
+        self.model.eval()
+
+        for standard_question_index, questions in self.train_data.dataset.knwb.items():
+            for question in questions:
+                self.question_index_to_standard_question_index[len(self.knwb_vectors)] = standard_question_index
+
+                input_ids = self.encode_single_sentence(question)
+
+                with torch.no_grad():
+                    input_ids = input_ids.unsqueeze(0)
+                    if torch.cuda.is_available():
+                        input_ids = input_ids.cuda()
+
+                    vector = self.model(input_ids).detach().cpu()
+                self.knwb_vectors.append(vector)
+
+        self.knwb_vectors = torch.cat(self.knwb_vectors, dim=0)
+        return
+
+    def eval(self, epoch):
+        self.logger.info("开始测试第%d轮模型效果：" % epoch)
+        self.stats_dict = {"correct": 0, "wrong": 0}
+        self.model.eval()
+        self.knwb_to_vector()
+
+        if torch.cuda.is_available():
+            knwb_vectors = self.knwb_vectors.cuda()
+        else:
+            knwb_vectors = self.knwb_vectors
+
+        predicts = []
+        labels_list = []
+
+        knwb_vectors_normalized = F.normalize(knwb_vectors, p=2, dim=1)
+
+        for index, batch_data in enumerate(self.valid_data):
+            test_questions, labels_tensors = batch_data
+
+            batch_test_ids = [self.encode_single_sentence(q) for q in test_questions]
+
+            with torch.no_grad():
+                batch_test_ids = torch.stack(batch_test_ids)
+                if torch.cuda.is_available():
+                    batch_test_ids = batch_test_ids.cuda()
+
+                test_vectors = self.model(batch_test_ids)
+
+                test_vectors = F.normalize(test_vectors, p=2, dim=1)
+
+                similarity_scores = torch.matmul(test_vectors, knwb_vectors_normalized.transpose(0, 1))
+
+                hit_indices = torch.argmax(similarity_scores, dim=1).cpu().tolist()
+
+            predicts.extend(hit_indices)
+            labels_list.extend([l.item() for l in labels_tensors])
+
+        self.write_stats(predicts, labels_list)
+        self.show_stats()
+        return
+
+    def write_stats(self, predicts, labels):
+        assert len(labels) == len(predicts)
+        for hit_index, label in zip(predicts, labels):
+            hit_index = self.question_index_to_standard_question_index[hit_index]
+            if int(hit_index) == int(label):
+                self.stats_dict["correct"] += 1
+            else:
+                self.stats_dict["wrong"] += 1
+        return
+
+    def show_stats(self):
+        correct = self.stats_dict["correct"]
+        wrong = self.stats_dict["wrong"]
+        self.logger.info("预测集合条目总量：%d" % (correct + wrong))
+        self.logger.info("预测正确条目：%d，预测错误条目：%d" % (correct, wrong))
+        self.logger.info("预测准确率：%f" % (correct / (correct + wrong)))
+        self.logger.info("--------------------")
+        return
